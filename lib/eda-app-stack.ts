@@ -31,16 +31,17 @@ export class EDAAppStack extends cdk.Stack {
       tableName: "Imagess",
  });
 
-
-    // Output
-    
-    new cdk.CfnOutput(this, "bucketName", {
-      value: imagesBucket.bucketName,
-    });
-
   // Integration infrastructure
 
-  
+  const mailerQ = new sqs.Queue(this, "mailer-q", {
+    receiveMessageWaitTime: cdk.Duration.seconds(10),
+  });
+
+
+  const newImageTopic = new sns.Topic(this, "NewImageTopic", {
+    displayName: "New Image topic",
+  }); 
+
   const dlq = new sqs.Queue(this, "img-dlq", {
     receiveMessageWaitTime: cdk.Duration.seconds(10),
 });
@@ -53,14 +54,7 @@ export class EDAAppStack extends cdk.Stack {
 }
 });
 
-  const mailerQ = new sqs.Queue(this, "mailer-q", {
-    receiveMessageWaitTime: cdk.Duration.seconds(10),
-  });
 
-
-  const newImageTopic = new sns.Topic(this, "NewImageTopic", {
-    displayName: "New Image topic",
-  }); 
 
   const newImageMailEventSource = new events.SqsEventSource(mailerQ, {
     batchSize: 5,
@@ -68,10 +62,16 @@ export class EDAAppStack extends cdk.Stack {
   }); 
 
 
-  newImageTopic.addSubscription(
-    new subs.SqsSubscription(queue)
-  );
-  newImageTopic.addSubscription(new subs.SqsSubscription(mailerQ));
+
+    // Output
+    
+    new cdk.CfnOutput(this, "bucketName", {
+      value: imagesBucket.bucketName,
+    });
+    new cdk.CfnOutput(this, "SNS Topic ARN", {
+      value: newImageTopic.topicArn ,
+      });
+      
 
 
 
@@ -113,6 +113,36 @@ const processImageFn = new lambdanode.NodejsFunction(
   );
 
 
+  const addMetadataFn = new lambdanode.NodejsFunction(
+    this,
+    "addMetadataFn",
+{
+      runtime: lambda.Runtime.NODEJS_20_X,
+      entry: `${__dirname}/../lambdas/addImageMetadata.ts`,
+      timeout: cdk.Duration.seconds(15),
+      memorySize: 128,
+      environment: {
+        TABLE_NAME: imagesTable.tableName,
+      },
+  }
+);
+
+imagesTable.grantReadWriteData(addMetadataFn);
+
+
+
+newImageTopic.addSubscription(
+  new subs.LambdaSubscription(addMetadataFn, {
+    filterPolicy: {
+      metadata_type: sns.SubscriptionFilter.stringFilter({
+        allowlist: ["Caption", "Date", "Photographer"],
+  }),
+  },
+})
+);
+
+
+
 const rejectedImageEventSource = new events.SqsEventSource(dlq, {
   batchSize: 5,
   maxBatchingWindow: cdk.Duration.seconds(10),
@@ -139,6 +169,45 @@ mailerFn.addToRolePolicy(
   })
 );
 
+newImageTopic.addSubscription(
+  new subs.SqsSubscription(queue, {
+    filterPolicyWithMessageBody: {
+      Records: sns.FilterOrPolicy.policy({
+        s3: sns.FilterOrPolicy.policy({
+          object: sns.FilterOrPolicy.policy({
+            key: sns.FilterOrPolicy.filter(
+              sns.SubscriptionFilter.stringFilter({
+                matchPrefixes: ["image"],
+             })
+
+         ),
+       }),
+     }),
+     }),
+     },
+    rawMessageDelivery: true,
+  })
+);
+
+
+newImageTopic.addSubscription(
+  new subs.SqsSubscription(mailerQ, {
+    filterPolicyWithMessageBody: {
+      Records: sns.FilterOrPolicy.policy({
+        s3: sns.FilterOrPolicy.policy({
+          object: sns.FilterOrPolicy.policy({
+            key: sns.FilterOrPolicy.filter(
+              sns.SubscriptionFilter.stringFilter({
+                matchPrefixes: ["image"],
+              })
+            ),
+          }),
+        }),
+       }),
+     },
+    rawMessageDelivery: true,
+  })
+);
 
 
  // SQS --> Lambda
@@ -156,6 +225,6 @@ mailerFn.addToRolePolicy(
   imagesBucket.grantRead(processImageFn);
   imagesTable.grantReadWriteData(processImageFn);
 
+
   }
 }
-
